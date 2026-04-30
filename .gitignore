@@ -1,0 +1,12 @@
+.env.local
+.DS_Store
+__pycache__
+*.egg-info
+logs/
+temp/
+.env
+*.m4a
+frontend/e2e/.seed.json
+*.md
+!README.md
+
