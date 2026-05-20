@@ -130,6 +130,9 @@ async def create_task(request: Request, db: AsyncSession = Depends(get_db)):
     add_subtitles = data.get("add_subtitles", True)
     if not isinstance(add_subtitles, bool):
         add_subtitles = True
+    focus_mode = data.get("focus_mode", "auto")
+    if focus_mode not in {"auto", "left", "center", "right"}:
+        focus_mode = "auto"
     if not raw_source or not raw_source.get("url"):
         raise HTTPException(status_code=400, detail="Source URL is required")
 
@@ -173,6 +176,7 @@ async def create_task(request: Request, db: AsyncSession = Depends(get_db)):
             processing_mode,
             output_format,
             add_subtitles,
+            focus_mode,
         )
 
         # Save source metadata for resume/retries in environments without sources.url column
@@ -187,6 +191,7 @@ async def create_task(request: Request, db: AsyncSession = Depends(get_db)):
                     "source_type": source_type,
                     "output_format": output_format,
                     "add_subtitles": add_subtitles,
+                    "focus_mode": focus_mode,
                 }),
                 ex=60 * 60 * 24 * 7,
             )
@@ -606,6 +611,9 @@ async def apply_task_settings(
         caption_template = payload.get("caption_template", "default")
         include_broll = bool(payload.get("include_broll", False))
         apply_to_existing = bool(payload.get("apply_to_existing", False))
+        focus_mode = payload.get("focus_mode", "auto")
+        if focus_mode not in {"auto", "left", "center", "right"}:
+            focus_mode = "auto"
 
         task_service = TaskService(db)
         await _require_task_owner(request, task_service, db, task_id)
@@ -624,6 +632,7 @@ async def apply_task_settings(
             caption_template,
             include_broll,
             apply_to_existing,
+            focus_mode,
         )
         return {"task": task, "message": "Task settings updated"}
     except ValueError as e:

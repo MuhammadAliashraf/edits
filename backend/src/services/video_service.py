@@ -197,6 +197,7 @@ class VideoService:
                 font_color,
                 caption_template,
                 output_format,
+                focus_side,
             )
 
             if not success:

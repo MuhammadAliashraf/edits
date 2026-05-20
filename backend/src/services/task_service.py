@@ -509,6 +509,7 @@ class TaskService:
         caption_template: str,
         include_broll: bool,
         apply_to_existing: bool,
+        focus_mode: str = "auto",
     ) -> Dict[str, Any]:
         """Update task-level settings and optionally regenerate all clips."""
         await self.task_repo.update_task_settings(
@@ -528,6 +529,7 @@ class TaskService:
                 font_size,
                 font_color,
                 caption_template,
+                focus_mode=focus_mode,
             )
 
         return await self.get_task_with_clips(task_id) or {}
@@ -539,6 +541,7 @@ class TaskService:
         font_size: int,
         font_color: str,
         caption_template: str,
+        focus_mode: str = "auto",
     ) -> None:
         """Regenerate all clips in a task using existing segment boundaries."""
         task = await self.task_repo.get_task_by_id(self.db, task_id)
@@ -550,7 +553,7 @@ class TaskService:
         output_format = "vertical"
         add_subtitles = True
 
-        # Preserve original output_format and add_subtitles from task creation (stored in Redis)
+        # Restore original output_format, add_subtitles, and focus_mode from Redis
         redis_client = redis.Redis(
             host=self.config.redis_host,
             port=self.config.redis_port,
@@ -567,6 +570,9 @@ class TaskService:
                 asub = parsed.get("add_subtitles", add_subtitles)
                 if isinstance(asub, bool):
                     add_subtitles = asub
+                stored_focus = parsed.get("focus_mode", focus_mode)
+                if stored_focus in ("auto", "left", "center", "right"):
+                    focus_mode = stored_focus
         finally:
             await redis_client.close()
 
@@ -588,14 +594,20 @@ class TaskService:
             if not video_path.exists():
                 raise ValueError("Source video file no longer exists")
 
-        segments = [
-            {
+        focus_side = focus_mode if focus_mode in ("left", "center", "right") else None
+        clips_output_dir = Path(self.config.temp_dir) / "clips"
+        clips_output_dir.mkdir(parents=True, exist_ok=True)
+
+        await self.clip_repo.delete_clips_by_task(self.db, task_id)
+
+        clip_ids = []
+        for i, clip in enumerate(clips):
+            segment = {
                 "start_time": clip["start_time"],
                 "end_time": clip["end_time"],
                 "text": clip.get("text") or "",
                 "relevance_score": clip.get("relevance_score", 0.5),
-                "reasoning": clip.get("reasoning")
-                or "Regenerated with updated settings",
+                "reasoning": clip.get("reasoning") or "Regenerated with updated settings",
                 "virality_score": clip.get("virality_score", 0),
                 "hook_score": clip.get("hook_score", 0),
                 "engagement_score": clip.get("engagement_score", 0),
@@ -603,24 +615,22 @@ class TaskService:
                 "shareability_score": clip.get("shareability_score", 0),
                 "hook_type": clip.get("hook_type"),
             }
-            for clip in clips
-        ]
+            clip_info = await self.video_service.create_single_clip(
+                video_path,
+                segment,
+                i,
+                clips_output_dir,
+                font_family,
+                font_size,
+                font_color,
+                caption_template,
+                output_format,
+                add_subtitles,
+                focus_side,
+            )
+            if clip_info is None:
+                continue
 
-        clips_info = await self.video_service.create_video_clips(
-            video_path,
-            segments,
-            font_family,
-            font_size,
-            font_color,
-            caption_template,
-            output_format,
-            add_subtitles,
-        )
-
-        await self.clip_repo.delete_clips_by_task(self.db, task_id)
-
-        clip_ids = []
-        for i, clip_info in enumerate(clips_info):
             clip_id = await self.clip_repo.create_clip(
                 self.db,
                 task_id=task_id,
@@ -631,8 +641,7 @@ class TaskService:
                 duration=clip_info["duration"],
                 text=clip_info.get("text") or "",
                 relevance_score=clip_info.get("relevance_score", 0.5),
-                reasoning=clip_info.get("reasoning")
-                or "Regenerated with updated settings",
+                reasoning=clip_info.get("reasoning") or "Regenerated with updated settings",
                 clip_order=i + 1,
                 virality_score=clip_info.get("virality_score", 0),
                 hook_score=clip_info.get("hook_score", 0),

@@ -97,6 +97,7 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [sourceTitle, setSourceTitle] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const progressRef = useRef<HTMLDivElement | null>(null);
   const { data: session, isPending } = useSession();
   const isAdmin = Boolean((session?.user as { is_admin?: boolean } | undefined)?.is_admin);
 
@@ -399,6 +400,7 @@ export default function Home() {
     setStatusMessage("");
     setCurrentStep("");
     setSourceTitle(null);
+    setTimeout(() => progressRef.current?.scrollIntoView({ behavior: "smooth", block: "center" }), 50);
 
     const normalizedColor = /^#[0-9A-Fa-f]{6}$/.test(fontColor)
       ? fontColor
@@ -409,25 +411,47 @@ export default function Home() {
 
       // If uploading file, upload it first
       if (sourceType === "upload" && fileRef.current) {
+        setCurrentStep("upload");
         setStatusMessage("Uploading video file...");
-        setProgress(5);
+        setProgress(1);
 
         const formData = new FormData();
         formData.append("video", fileRef.current);
-        const uploadResponse = await fetch("/api/upload", {
-          method: "POST",
-          body: formData
+
+        const uploadResult = await new Promise<{ video_path: string }>((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+
+          xhr.upload.onprogress = (event) => {
+            if (event.lengthComputable) {
+              // Map upload progress to 0–10% of the overall flow
+              setProgress(Math.round((event.loaded / event.total) * 10));
+            }
+          };
+
+          xhr.onload = () => {
+            if (xhr.status >= 200 && xhr.status < 300) {
+              try {
+                resolve(JSON.parse(xhr.responseText));
+              } catch {
+                reject(new Error("Invalid response from upload"));
+              }
+            } else {
+              try {
+                const body = JSON.parse(xhr.responseText);
+                reject(new Error(formatSupportMessage(body.detail || body.error || `Upload failed (${xhr.status})`)));
+              } catch {
+                reject(new Error(`Upload failed (${xhr.status})`));
+              }
+            }
+          };
+
+          xhr.onerror = () => reject(new Error("Network error during upload"));
+          xhr.onabort = () => reject(new Error("Upload cancelled"));
+
+          xhr.open("POST", "/api/upload");
+          xhr.send(formData);
         });
 
-        if (!uploadResponse.ok) {
-          const uploadError = await parseApiError(
-            uploadResponse,
-            `Upload error: ${uploadResponse.status}`
-          );
-          throw new Error(formatSupportMessage(uploadError));
-        }
-
-        const uploadResult = await uploadResponse.json();
         videoUrl = uploadResult.video_path;
       }
 
@@ -1143,10 +1167,10 @@ export default function Home() {
               </div>
 
               {isLoading && (
-                <div className="space-y-4">
+                <div ref={progressRef} className="space-y-4">
                   <div className="space-y-2">
                     <div className="flex justify-between text-sm">
-                      <span className="text-muted-foreground">Processing</span>
+                      <span className="text-muted-foreground">{currentStep === "upload" ? "Uploading" : "Processing"}</span>
                       <span className="text-foreground font-medium">{progress}%</span>
                     </div>
                     <Progress value={progress} className="h-2" />

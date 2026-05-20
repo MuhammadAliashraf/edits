@@ -19,8 +19,6 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - ./frontend/src:/app/src
-      - ./frontend/public:/app/public
       - ./frontend/prisma:/app/prisma
     environment:
       - NEXT_TELEMETRY_DISABLED=1
@@ -62,7 +60,7 @@ services:
     container_name: igedits-backend
     platform: linux/amd64
     command: [".venv/bin/uvicorn", "src.main_refactored:app", "--host", "0.0.0.0", "--port", "8000"]
-    # API server only — no video encoding, no GPU needed. Adjust to your host.
+    # Handles trim/split/regenerate encoding — needs GPU when VIDEO_ENCODER=nvenc.
     deploy:
       resources:
         limits:
@@ -71,6 +69,10 @@ services:
         reservations:
           cpus: "0.5"
           memory: 512M
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     ports:
       - "8000:8000"
     volumes:
@@ -79,6 +81,7 @@ services:
       - clips:/app/clips
       - ./backend/fonts:/app/fonts
       - ./backend/transitions:/app/transitions
+      - /usr/lib/wsl/lib:/usr/lib/wsl/lib:ro
     environment:
       - PYTHONPATH=/app
       - PYTHONUNBUFFERED=1
@@ -121,6 +124,8 @@ services:
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL}
       - MAKE_INSTAGRAM_WEBHOOK_URL=${MAKE_INSTAGRAM_WEBHOOK_URL}
       - PROCESSING_TASK_TIMEOUT_SECONDS=${PROCESSING_TASK_TIMEOUT_SECONDS:-1800}
+      - LD_LIBRARY_PATH=/usr/lib/wsl/lib
+      - FFMPEG_BINARY=/usr/bin/ffmpeg
     restart: unless-stopped
     depends_on:
       postgres:
@@ -166,6 +171,7 @@ services:
       - clips:/app/clips
       - ./backend/fonts:/app/fonts
       - ./backend/transitions:/app/transitions
+      - /usr/lib/wsl/lib:/usr/lib/wsl/lib:ro
     environment:
       - PYTHONPATH=/app
       - PYTHONUNBUFFERED=1
@@ -174,6 +180,8 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - LD_LIBRARY_PATH=/usr/lib/wsl/lib
+      - FFMPEG_BINARY=/usr/bin/ffmpeg
       - ASSEMBLY_AI_API_KEY=${ASSEMBLY_AI_API_KEY}
       - APIFY_API_TOKEN=${APIFY_API_TOKEN}
       - APIFY_YOUTUBE_DEFAULT_QUALITY=${APIFY_YOUTUBE_DEFAULT_QUALITY:-1080}
