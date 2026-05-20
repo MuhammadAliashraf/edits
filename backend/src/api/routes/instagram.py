@@ -1,6 +1,7 @@
-"""Instagram publishing via Make.com webhook."""
+"""Instagram publishing — Make.com webhook or direct via instagrapi."""
 
 import logging
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -14,6 +15,7 @@ from ...database import get_db
 from ...ai import generate_instagram_caption
 from ...repositories.clip_repository import ClipRepository
 from ...repositories.task_repository import TaskRepository
+from ...services import instagram_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/instagram", tags=["instagram"])
@@ -46,11 +48,85 @@ class PublishRequest(BaseModel):
         return v
 
 
+class CredentialsRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=255)
+    password: str = Field(min_length=1, max_length=255)
+
+
+# ---------------------------------------------------------------------------
+# Status / config endpoints
+# ---------------------------------------------------------------------------
+
 @router.get("/make-status")
 async def make_status():
     config = get_config()
     return {"enabled": bool(config.make_instagram_webhook_url)}
 
+
+@router.get("/status")
+async def instagram_status(request: Request, db: AsyncSession = Depends(get_db)):
+    """Return how Instagram publishing is configured for this user."""
+    config = get_config()
+    user_id = _get_user_id(request)
+
+    if config.make_instagram_webhook_url:
+        return {"method": "make", "connected": True}
+
+    creds = await instagram_service.get_credentials(
+        db, user_id, config.backend_auth_secret or ""
+    )
+    if creds:
+        return {"method": "direct", "connected": True, "username": creds["username"]}
+
+    return {"method": None, "connected": False}
+
+
+# ---------------------------------------------------------------------------
+# Credentials CRUD (direct / instagrapi flow)
+# ---------------------------------------------------------------------------
+
+@router.post("/credentials")
+async def save_credentials(
+    body: CredentialsRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    user_id = _get_user_id(request)
+    config = get_config()
+    if not config.backend_auth_secret:
+        raise HTTPException(status_code=500, detail="BACKEND_AUTH_SECRET is not configured")
+
+    await instagram_service.save_credentials(
+        db, user_id, body.username, body.password, config.backend_auth_secret
+    )
+    return {"status": "saved", "username": body.username}
+
+
+@router.get("/credentials")
+async def get_credentials(request: Request, db: AsyncSession = Depends(get_db)):
+    user_id = _get_user_id(request)
+    config = get_config()
+    if not config.backend_auth_secret:
+        raise HTTPException(status_code=500, detail="BACKEND_AUTH_SECRET is not configured")
+
+    creds = await instagram_service.get_credentials(
+        db, user_id, config.backend_auth_secret
+    )
+    if not creds:
+        return {"connected": False}
+    return {"connected": True, "username": creds["username"]}
+
+
+@router.delete("/credentials")
+async def delete_credentials(request: Request, db: AsyncSession = Depends(get_db)):
+    user_id = _get_user_id(request)
+    await instagram_service.delete_credentials(db, user_id)
+    return {"status": "disconnected"}
+
+
+# ---------------------------------------------------------------------------
+# Publish
+# ---------------------------------------------------------------------------
 
 @router.post("/publish")
 async def publish(
@@ -58,12 +134,6 @@ async def publish(
 ):
     user_id = _get_user_id(request)
     config = get_config()
-
-    if not config.make_instagram_webhook_url:
-        raise HTTPException(
-            status_code=503,
-            detail="Instagram publishing not configured (MAKE_INSTAGRAM_WEBHOOK_URL missing)",
-        )
 
     clip = await ClipRepository.get_clip_by_id(db, body.clip_id)
     if not clip:
@@ -73,24 +143,49 @@ async def publish(
     if not task or task.get("user_id") != user_id:
         raise HTTPException(status_code=403, detail="Not authorized for this clip")
 
-    public_url = f"{config.public_base_url}/clips/{clip['filename']}"
+    caption = body.caption or ""
 
+    # --- Make.com webhook (priority if configured) ---
+    if config.make_instagram_webhook_url:
+        public_url = f"{config.public_base_url}/clips/{clip['filename']}"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    config.make_instagram_webhook_url,
+                    json={"video_url": public_url, "caption": caption, "clip_id": body.clip_id},
+                )
+                resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            logger.error("Make.com webhook returned error: %s", e)
+            raise HTTPException(status_code=502, detail="Make.com webhook returned an error") from e
+        except httpx.RequestError as e:
+            logger.error("Failed to reach Make.com webhook: %s", e)
+            raise HTTPException(status_code=502, detail="Could not reach Make.com webhook") from e
+        return {"status": "sent", "video_url": public_url}
+
+    # --- Direct instagrapi ---
+    if not config.backend_auth_secret:
+        raise HTTPException(status_code=503, detail="Instagram publishing not configured")
+
+    clip_path = Path(config.temp_dir) / "clips" / clip["filename"]
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                config.make_instagram_webhook_url,
-                json={"video_url": public_url, "caption": body.caption or "", "clip_id": body.clip_id},
-            )
-            resp.raise_for_status()
-    except httpx.HTTPStatusError as e:
-        logger.error("Make.com webhook returned error: %s", e)
-        raise HTTPException(status_code=502, detail="Make.com webhook returned an error") from e
-    except httpx.RequestError as e:
-        logger.error("Failed to reach Make.com webhook: %s", e)
-        raise HTTPException(status_code=502, detail="Could not reach Make.com webhook") from e
+        permalink = await instagram_service.post_reel(
+            db, user_id, clip_path, caption, config.backend_auth_secret
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        logger.error("Instagram direct publish failed: %s", e)
+        raise HTTPException(status_code=502, detail=f"Instagram error: {e}") from e
 
-    return {"status": "sent", "video_url": public_url}
+    return {"status": "posted", "permalink": permalink}
 
+
+# ---------------------------------------------------------------------------
+# Caption suggestion
+# ---------------------------------------------------------------------------
 
 @router.get("/suggest-caption")
 async def suggest_caption(

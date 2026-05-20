@@ -9,7 +9,7 @@ No watermarks, no per-minute quotas, no vendor lock-in.
 1. **Ingest** — pull a video from a YouTube URL (via `yt-dlp`) or accept a direct upload.
 2. **Transcribe** — word-level timestamps via AssemblyAI (cloud) or optional local Whisper.
 3. **Analyze** — a Pydantic-AI agent selects 3–7 viral segments (10–45s each) and scores them on hook / engagement / value / shareability.
-4. **Render** — MoviePy assembles each segment into a 9:16 clip with face-centered crop, burned-in captions, optional transitions, and optional B-roll overlays.
+4. **Render** — MoviePy assembles each segment into a 9:16 clip with configurable crop position (left / center / right, or auto face-detect), burned-in captions, optional transitions, and optional B-roll overlays.
 5. **Serve** — clips are stored on disk and surfaced to the frontend for preview, editing, and export.
 
 ---
@@ -101,10 +101,18 @@ RESEND_FROM_EMAIL=no-reply@your-domain.com
 
 ### 3. Start
 
+**Option A — quick-start script** (validates your `.env` and checks Docker before launching):
+
 ```bash
-docker-compose up -d
+bash start.sh
+```
+
+**Option B — direct compose**:
+
+```bash
+docker compose up -d --build
 # first boot pulls images and runs init.sql — tail with:
-docker-compose logs -f
+docker compose logs -f
 ```
 
 Open **http://localhost:3000**, create an account, and submit a video.
@@ -156,7 +164,7 @@ Requirements: NVIDIA GPU, [NVIDIA Container Toolkit](https://docs.nvidia.com/dat
 VIDEO_ENCODER=nvenc
 ```
 
-**Step 2** — in `docker-compose.yml`, on the `worker` service only (the backend is API-only, no encoding): comment out the CPU `deploy` block and uncomment the GPU `deploy` block. The blocks are already in the file — just swap the comments:
+**Step 2** — in `docker-compose.yml`, on the `worker` service, comment out the CPU `deploy` block and uncomment the GPU `deploy` block. The blocks are already in the file — just swap the comments:
 
 ```yaml
 # Comment this out:
@@ -176,13 +184,15 @@ deploy:
           capabilities: [gpu]
 ```
 
-**Step 3** — rebuild:
+The `backend` service already has a GPU device reservation in `docker-compose.yml` — no changes needed there.
+
+**Step 3** — recreate both containers so the device reservation takes effect:
 
 ```bash
-docker-compose up -d --build
+docker compose up -d --no-deps --build backend worker
 ```
 
-The `worker` container picks up `VIDEO_ENCODER=nvenc` and switches FFmpeg to `h264_nvenc` automatically. The backend container does not need GPU access (it handles only API requests).
+Both the `worker` (clip generation) and `backend` (trim / split / regenerate) pick up `VIDEO_ENCODER=nvenc` and switch FFmpeg to `h264_nvenc` automatically.
 
 > **AMD / Intel GPU**: not supported out of the box. You would need to swap the Dockerfile base image and install a compatible FFmpeg build.
 
@@ -229,6 +239,15 @@ Templates live in `backend/src/caption_templates.py` and bundle animation style,
 | `neon`    | Bright glow highlight                            |
 | `podcast` | Centered, small, low-key                         |
 
+### Arabic, Urdu, and RTL languages
+
+igedits automatically detects Arabic-script text (Arabic, Urdu, etc.) in transcripts and handles it correctly:
+
+- Switches to the bundled **Noto Naskh Arabic** font so glyphs render instead of boxes.
+- Applies letter-shaping (`arabic-reshaper`) and the Unicode bidi algorithm (`python-bidi`) so characters form proper ligatures and display right-to-left.
+
+No configuration needed — it is automatic. For other non-Latin scripts (e.g. Devanagari, CJK), drop a compatible `.ttf` into `backend/fonts/` and select it as your font for that task; the font picker will surface it automatically.
+
 ### Adding assets
 
 - **Fonts**: drop `.ttf` files into `backend/fonts/` — they appear in the font picker automatically.
@@ -236,52 +255,85 @@ Templates live in `backend/src/caption_templates.py` and bundle animation style,
 
 ---
 
-## Instagram publishing via Make.com {#instagram-publishing-via-makecom}
+## Instagram publishing
 
-igedits publishes to Instagram through [Make.com](https://make.com) (free tier works). No Meta Developer App, no OAuth token management — you connect your Instagram account once inside Make.com and the backend sends a single webhook.
+Two methods are available. The backend tries **Method A first**; if no webhook is configured it falls back to **Method B**.
 
-> **Requirement:** Your Instagram must be a **Creator** or **Business** account. Personal accounts cannot publish Reels via API. If yours is personal, go to Instagram → Settings → Account → Switch to Professional Account → Creator.
+### Method A — Make.com webhook (Business/Creator accounts)
 
-### Step 1 — Build the scenario
+Requires an Instagram **Creator** or **Business** account linked to a Facebook Page. Personal accounts cannot publish Reels via the Meta API.
 
-1. Sign up at [make.com](https://make.com) → go to **Scenarios** → **Create a new scenario**.
-2. Click the **+** to add the first module → search **Webhooks** → select **Custom webhook**.
-   - Click **Add** → name it "igedits" → click **Save**.
-   - Copy the **webhook URL** shown (you'll need it in Step 2).
-3. Click the **+** after the webhook module → search **Instagram for Business** → select **Create a Reel**.
-4. In the **Connection** field, click **Add** → Make.com opens a Facebook login popup.
-   - Log in with the **Facebook account linked to your Instagram**.
-   - Grant the requested permissions → click **Continue** / **Done**.
-   - Your Instagram account is now connected.
-5. Fill in the module fields:
+> If your account is personal: Instagram → Settings → Account → Switch to Professional Account → Creator.
+
+**Set up the Make.com scenario:**
+
+1. Sign up at [make.com](https://make.com) → **Scenarios** → **Create a new scenario**.
+2. Add module: **Webhooks → Custom webhook** → click **Add** → name it "igedits" → **Save**. Copy the webhook URL.
+3. Add module: **Instagram for Business → Create a Reel**.
+4. In **Connection** → **Add** → log in with the Facebook account linked to your Instagram → grant permissions.
+5. Fill in:
    - **Page** → select your Facebook Page.
-   - **Video URL** → click the field, enable mapping (the toggle icon), type `{{1.video_url}}`.
-   - **Caption** → `{{1.caption}}`.
-6. Click **OK** → click **Save** → click the **Activate scenario** toggle (top right).
+   - **Video URL** → enable mapping → `{{1.video_url}}`
+   - **Caption** → `{{1.caption}}`
+6. **OK** → **Save** → **Activate scenario**.
 
-> **No Facebook Page?** Instagram Business/Creator accounts must be linked to a Facebook Page — this is a Meta requirement regardless of which tool you use. Go to [Meta Business Suite](https://business.facebook.com) → Add Page → connect your Instagram. Takes ~2 minutes.
+> **No Facebook Page?** Required by Meta regardless of tool. Go to [Meta Business Suite](https://business.facebook.com) → Add Page → connect your Instagram.
 
-### Step 3 — Connect to igedits
-
-Paste the webhook URL from Step 2 into your `.env`:
+**Connect to igedits:**
 
 ```env
 MAKE_INSTAGRAM_WEBHOOK_URL=https://hook.eu2.make.com/xxxxxxxxxxxxxxxxxxxxxxxx
+PUBLIC_BASE_URL=https://your-backend-domain.com   # Make.com must reach this to download clips
 ```
 
-Restart the backend: `docker-compose up -d backend`
+Restart: `docker compose up -d backend`
 
-### How it works
+---
 
-When you click **Publish to Instagram** on a clip, the backend sends:
+### Method B — Direct login (any account, no Make.com needed)
 
-```json
-{ "video_url": "https://api-igedits.asal.life/clips/clip_1.mp4", "caption": "..." }
+Connect your Instagram account with just a username and password — no Meta Developer App, no OAuth, no Facebook Page required. Works with personal accounts.
+
+**Set up:**
+
+1. Open igedits → **Settings → Integrations**.
+2. Enter your Instagram username and password → **Connect**.
+3. The status shows **Connected as @username** when ready.
+
+**Publish:** Open any completed task → click **Post to Instagram** on a clip → enter a caption → **Post**. The clip uploads as a Reel directly from your server.
+
+**Limitations:**
+- Accounts with **2FA enabled** are not supported — disable 2FA or use a secondary account without 2FA.
+- On first login from a new server, Instagram may send a **verification challenge** (email/SMS code). If this happens, log in from your phone first to clear the challenge, then try again.
+- Credentials are **encrypted at rest** (Fernet/AES-256) and stored only on your server. Sessions are cached so re-login is rare.
+- This method uses the unofficial Instagram private API. It is not affiliated with or endorsed by Meta.
+
+---
+
+### How publishing works
+
+When you click **Publish to Instagram** on a clip:
+
+- If `MAKE_INSTAGRAM_WEBHOOK_URL` is set → the backend sends `{ "video_url": "...", "caption": "..." }` to Make.com, which downloads and posts the Reel (~30 seconds).
+- Otherwise → the backend uploads the clip file directly via the direct-login session.
+
+---
+
+## Auto-updates
+
+`install_cron.sh` installs a cron job that pulls the latest changes from git and restarts Docker every 3 hours — useful for keeping a self-hosted instance current without manual intervention.
+
+```bash
+bash install_cron.sh
 ```
 
-Make.com receives this, downloads the video from `video_url`, and posts it as a Reel on the connected account. The clip appears on Instagram in ~30 seconds.
+What it does:
+- Creates `.cron/update_and_restart.sh` in the repo directory.
+- Adds a crontab entry (`0 */3 * * *`) that runs the updater.
+- The updater skips if there are local uncommitted changes (safe to run alongside custom `.env` edits).
+- Logs to `cron_update.log` in the repo root.
 
-> **Tip:** The clip must be accessible at `PUBLIC_BASE_URL` (your backend's public URL). Make.com must be able to download it over HTTPS. If `MAKE_INSTAGRAM_WEBHOOK_URL` is not set, the publish button still appears but returns a 503 error.
+To remove: `crontab -e` and delete the lines between `# igedits-auto-update-start` and `# igedits-auto-update-end`.
 
 ---
 

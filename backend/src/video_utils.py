@@ -30,6 +30,41 @@ logger = logging.getLogger(__name__)
 config = Config()
 TRANSCRIPT_CACHE_SCHEMA_VERSION = 2
 
+# Arabic/Urdu Unicode block range U+0600–U+06FF
+_ARABIC_RANGE = range(0x0600, 0x0700)
+
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display as _bidi_display
+    _ARABIC_SUPPORT = True
+except ImportError:
+    _ARABIC_SUPPORT = False
+    logger.warning("arabic-reshaper/python-bidi not installed; Arabic/Urdu subtitles will be garbled")
+
+# Bundled Arabic/Urdu-capable font name (available in backend/fonts/)
+_ARABIC_FONT_NAME = "NotoNaskhArabic-Regular"
+
+
+def _contains_arabic(text: str) -> bool:
+    return any(ord(c) in _ARABIC_RANGE for c in text)
+
+
+def prepare_subtitle_text(text: str) -> str:
+    """Reshape and apply bidi algorithm for Arabic/Urdu text so moviepy renders it correctly."""
+    if not _contains_arabic(text):
+        return text
+    if not _ARABIC_SUPPORT:
+        return text
+    reshaped = arabic_reshaper.reshape(text)
+    return _bidi_display(reshaped)
+
+
+def get_font_for_text(text: str, font_family: str) -> str:
+    """Return font_family unchanged for Latin; switch to Arabic font for Arabic/Urdu script."""
+    if _contains_arabic(text):
+        return _ARABIC_FONT_NAME
+    return font_family
+
 
 # AssemblyAI deprecated the singular `speech_model` field; the API now requires
 # `speech_models` (plural list). The installed SDK still serializes the old name,
@@ -72,6 +107,14 @@ class VideoProcessor:
         if not resolved_font:
             resolved_font = find_font_path("THEBOLDFONT")
         self.font_path = str(resolved_font) if resolved_font else ""
+        arabic_font = find_font_path(_ARABIC_FONT_NAME)
+        self.arabic_font_path = str(arabic_font) if arabic_font else self.font_path
+
+    def resolve_font_for_text(self, text: str) -> str:
+        """Return the Arabic font path when text contains Arabic/Urdu script."""
+        if _contains_arabic(text):
+            return self.arabic_font_path
+        return self.font_path
 
     def get_optimal_encoding_settings(
         self, target_quality: str = "high"
@@ -132,9 +175,29 @@ def get_video_transcript(video_path: Path, speech_model: str = "best") -> str:
         language_code=config.transcript_language or None,
     )
 
+    audio_path = video_path.with_suffix(".aai_audio.mp3")
     try:
         logger.info("Starting AssemblyAI transcription")
-        transcript = transcriber.transcribe(str(video_path), config=config_obj)
+        # Extract audio-only before uploading to AssemblyAI — avoids uploading
+        # large video files (e.g. 2 GB) when only audio data is needed.
+        try:
+            import subprocess
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", str(video_path),
+                    "-vn", "-ac", "1", "-ar", "16000", "-q:a", "5",
+                    str(audio_path),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            upload_path = audio_path
+            logger.info(f"Extracted audio for transcription: {audio_path} ({audio_path.stat().st_size // 1024} KB)")
+        except Exception as exc:
+            logger.warning(f"Audio extraction failed ({exc}), falling back to original file")
+            upload_path = video_path
+
+        transcript = transcriber.transcribe(str(upload_path), config=config_obj)
 
         if transcript.status == aai.TranscriptStatus.error:
             logger.error(f"AssemblyAI transcription failed: {transcript.error}")
@@ -154,6 +217,9 @@ def get_video_transcript(video_path: Path, speech_model: str = "best") -> str:
     except Exception as e:
         logger.error(f"Error in transcription: {e}")
         raise
+    finally:
+        if audio_path.exists():
+            audio_path.unlink(missing_ok=True)
 
 
 def cache_transcript_data(video_path: Path, transcript) -> None:
@@ -323,6 +389,7 @@ def detect_optimal_crop_region(
     start_time: float,
     end_time: float,
     target_ratio: float = 9 / 16,
+    focus_side: Optional[str] = None,
 ) -> Tuple[int, int, int, int]:
     """Detect optimal crop region using improved face detection."""
     try:
@@ -335,6 +402,18 @@ def detect_optimal_crop_region(
         else:
             new_width = round_to_even(original_width)
             new_height = round_to_even(int(original_width / target_ratio))
+
+        # Fixed-side crop: skip face detection entirely
+        if focus_side in ("left", "center", "right"):
+            if focus_side == "left":
+                x_offset = 0
+            elif focus_side == "right":
+                x_offset = round_to_even(original_width - new_width)
+            else:  # center
+                x_offset = round_to_even((original_width - new_width) // 2)
+            y_offset = round_to_even((original_height - new_height) // 2)
+            logger.info(f"Fixed {focus_side} crop: offset ({x_offset}, {y_offset})")
+            return (x_offset, y_offset, new_width, new_height)
 
         # Try improved face detection
         face_centers = detect_faces_in_clip(video_clip, start_time, end_time)
@@ -841,6 +920,7 @@ def create_static_subtitles(
             continue
 
         text = " ".join(word["text"] for word in word_group)
+        rendered_text = prepare_subtitle_text(text)
 
         try:
             stroke_color = template.get("stroke_color", "black")
@@ -848,8 +928,8 @@ def create_static_subtitles(
 
             text_clip = (
                 TextClip(
-                    text=text,
-                    font=processor.font_path,
+                    text=rendered_text,
+                    font=processor.resolve_font_for_text(text),
                     font_size=calculated_font_size,
                     color=template["font_color"],
                     stroke_color=stroke_color if stroke_color else None,
@@ -904,9 +984,11 @@ def create_karaoke_subtitles(
     def measure_word_group_width(word_group: List[Dict], font_size: int) -> List[int]:
         widths: List[int] = []
         for word in word_group:
+            raw_word = word["text"]
+            rendered_word = prepare_subtitle_text(raw_word)
             temp_clip = TextClip(
-                text=word["text"],
-                font=processor.font_path,
+                text=rendered_word,
+                font=processor.resolve_font_for_text(raw_word),
                 font_size=font_size,
                 color=normal_color,
                 stroke_color=template.get("stroke_color", "black"),
@@ -963,11 +1045,13 @@ def create_karaoke_subtitles(
                     color = highlight_color if is_current else normal_color
                     # Scale up current word slightly for pop effect
                     size_multiplier = 1.1 if is_current else 1.0
+                    raw_word = word["text"]
+                    rendered_word = prepare_subtitle_text(raw_word)
 
                     word_clip = (
                         TextClip(
-                            text=word["text"],
-                            font=processor.font_path,
+                            text=rendered_word,
+                            font=processor.resolve_font_for_text(raw_word),
                             font_size=int(font_size_for_group * size_multiplier),
                             color=color,
                             stroke_color=template.get("stroke_color", "black"),
@@ -1030,6 +1114,7 @@ def create_pop_subtitles(
 
         # Show the full group text
         group_text = " ".join(w["text"] for w in word_group)
+        rendered_group_text = prepare_subtitle_text(group_text)
         group_start = word_group[0]["start"]
         group_end = word_group[-1]["end"]
         group_duration = group_end - group_start
@@ -1041,8 +1126,8 @@ def create_pop_subtitles(
             # Create main text clip
             text_clip = (
                 TextClip(
-                    text=group_text,
-                    font=processor.font_path,
+                    text=rendered_group_text,
+                    font=processor.resolve_font_for_text(group_text),
                     font_size=calculated_font_size,
                     color=template["font_color"],
                     stroke_color=template.get("stroke_color", "black"),
@@ -1099,6 +1184,7 @@ def create_fade_subtitles(
             continue
 
         group_text = " ".join(w["text"] for w in word_group)
+        rendered_group_text = prepare_subtitle_text(group_text)
         group_start = word_group[0]["start"]
         group_end = word_group[-1]["end"]
         group_duration = group_end - group_start
@@ -1109,8 +1195,8 @@ def create_fade_subtitles(
         try:
             # Create text clip
             text_clip = TextClip(
-                text=group_text,
-                font=processor.font_path,
+                text=rendered_group_text,
+                font=processor.resolve_font_for_text(group_text),
                 font_size=calculated_font_size,
                 color=template["font_color"],
                 stroke_color=template.get("stroke_color")
@@ -1191,6 +1277,7 @@ def create_optimized_clip(
     font_color: str = "#FFFFFF",
     caption_template: str = "default",
     output_format: str = "vertical",
+    focus_side: Optional[str] = None,
 ) -> bool:
     """Create clip with optional subtitles. output_format: 'vertical' (9:16) or 'original' (keep source size)."""
     try:
@@ -1253,7 +1340,7 @@ def create_optimized_clip(
         else:
             # Vertical 9:16: face-centered crop, preserve native resolution
             x_offset, y_offset, new_width, new_height = detect_optimal_crop_region(
-                video, start_time, end_time, target_ratio=9 / 16
+                video, start_time, end_time, target_ratio=9 / 16, focus_side=focus_side
             )
             cropped_clip = clip.cropped(
                 x1=x_offset, y1=y_offset, x2=x_offset + new_width, y2=y_offset + new_height

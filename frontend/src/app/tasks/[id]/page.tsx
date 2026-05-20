@@ -56,6 +56,7 @@ import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from "@/comp
 import { Progress } from "@/components/ui/progress";
 import Link from "next/link";
 import DynamicVideoPlayer from "@/components/dynamic-video-player";
+import { PublishToInstagramModal } from "@/components/instagram/publish-to-instagram-modal";
 
 interface Clip {
   id: string;
@@ -139,6 +140,7 @@ export default function TaskPage() {
   const [availableTemplates, setAvailableTemplates] = useState<
     Array<{ id: string; name: string; description: string; animation: string }>
   >([]);
+  const [instagramEnabled, setInstagramEnabled] = useState(false);
   const hasTriggeredAutoRefresh = useRef(false);
 
   const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -271,6 +273,19 @@ export default function TaskPage() {
       }
     };
     void loadTemplates();
+
+    const loadInstagramStatus = async () => {
+      try {
+        const res = await fetch("/api/instagram/status", { cache: "no-store" });
+        if (res.ok) {
+          const data = await res.json();
+          setInstagramEnabled(Boolean(data.connected));
+        }
+      } catch {
+        // Instagram not available — silently skip
+      }
+    };
+    void loadInstagramStatus();
   }, [apiUrl]);
 
   // SSE effect - real-time progress updates
@@ -1212,6 +1227,9 @@ export default function TaskPage() {
                           <Download className="w-4 h-4" />
                           Export
                         </Button>
+                        {instagramEnabled && (
+                          <PublishToInstagramModal clipId={clip.id} />
+                        )}
                         <Select value={exportPreset} onValueChange={setExportPreset}>
                           <SelectTrigger className="h-8 w-28">
                             <SelectValue placeholder="Preset" />
